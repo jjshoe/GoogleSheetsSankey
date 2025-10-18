@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top" />
+    <meta charset="utf-8" />
+    <title>Insert Diagram</title>
+
+    <!-- D3 + d3-sankey -->
+    <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+    <script src="https://cdn.jsdelivr.net/npm/d3-sankey@0.12.3/dist/d3-sankey.min.js"></script>
+
+    <!-- canvg for export -->
+    <script src="https://cdn.jsdelivr.net/npm/canvg@3.0.10/lib/umd.js"></script>
+
+    <style>
+      :root { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+      body { margin: 16px; }
+
+      #chart {
+        max-height: 80vh;
+        overflow: auto;
+        border: 1px solid #eee;
+        position: relative;
+        background: #fff;
+      }
+
+      .row { display: flex; align-items: center; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
+      .btns { display: flex; gap: 8px; align-items: center; }
+      .spacer { flex: 1 1 auto; }
+      button { padding: 8px 12px; border-radius: 8px; border: 1px solid #ddd; cursor: pointer; background: #fff; }
+      button:hover { background: #f7f7f7; }
+      button:disabled { opacity: 0.6; cursor: not-allowed; }
+      #status { font-size: 0.95rem; color: #444; }
+
+      /* Mode switch (hidden until render complete) */
+      .mode { display: none; gap: 10px; align-items: center; padding: 6px 10px; border: 1px solid #eee; border-radius: 10px; background: #fafafa; }
+      .mode label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+      .mode input { accent-color: #444; }
+
+      /* Loader */
+      .loader { display: flex; align-items: center; gap: 10px; color: #555; padding: 14px; }
+      .spinner { width: 18px; height: 18px; border: 2px solid #ddd; border-top-color: #777; border-radius: 50%; animation: spin 0.9s linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+
+      svg text { font-size: 13px; fill: #111; }
+      .node rect { rx: 4px; }
+    </style>
+  </head>
+  <body>
+    <div id="chart"><div class="loader"><div class="spinner"></div>Loading…</div></div>
+    <div class="row">
+      <div class="mode" id="modeSwitch">
+        <label><input type="radio" name="labelMode" value="dollars" checked> Dollars</label>
+        <label><input type="radio" name="labelMode" value="percent"> % of Total</label>
+      </div>
+
+      <!-- NEW: Anonymize labels control -->
+      <div class="mode" id="anonymizeSwitch">
+        Alternate Labels
+        <label><input type="radio" name="anonymizeMode" value="names" checked> Off</label>
+        <label><input type="radio" name="anonymizeMode" value="anonymized"> On</label>
+      </div>
+
+      <span class="spacer"></span>
+      <span id="status"></span>
+    </div>
+
+    <script>
+      const LABEL_PAD = 8;
+
+      const fmtUSD0 = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+      const fmtPct1 = new Intl.NumberFormat('en-US', { style: 'percent', maximumFractionDigits: 1 });
+
+      /* ---------- Colors (unique per depth) ---------- */
+      function hash32(str){let h=2166136261>>>0;for(let i=0;i<str.length;i++){h^=str.charCodeAt(i);h=Math.imul(h,16777619);}return h>>>0;}
+      function getLinkEndpoints(l){const s=(typeof l.source==='string'||typeof l.source==='number')?String(l.source):(l.source&&l.source.id);
+                                   const t=(typeof l.target==='string'||typeof l.target==='number')?String(l.target):(l.target&&l.target.id);return [s,t];}
+      function computeDepths(nodes,links,rootId='NW'){const idTo=new Map(nodes.map(n=>[n.id,n]));const ch=new Map(nodes.map(n=>[n.id,[]]));
+        links.forEach(l=>{const[s,t]=getLinkEndpoints(l);if(ch.has(s)&&idTo.has(t))ch.get(s).push(t);});
+        const depth=new Map(nodes.map(n=>[n.id,Number.POSITIVE_INFINITY]));const q=[];if(idTo.has(rootId)){depth.set(rootId,0);q.push(rootId);}
+        while(q.length){const cur=q.shift();const d=depth.get(cur);for(const t of (ch.get(cur)||[])){if(depth.get(t)>d+1){depth.set(t,d+1);q.push(t);}}}
+        nodes.forEach(n=>{if(!isFinite(depth.get(n.id)))depth.set(n.id,1)});return depth;}
+      function assignColorsUniquePerDepth(nodes,links,rootId='NW'){const depths=computeDepths(nodes,links,rootId);const usedBy=new Map();const map=new Map();
+        function pick(base,list,min=24){const golden=137.50776405003785;let h=base%360;for(let k=0;k<24;k++){const ok=(list.length===0)||list.every(x=>{
+          const d=Math.abs(((h-x+540)%360)-180);return d>=min;});if(ok)return h;h=(h+golden)%360;}return h;}
+        const byDepth=new Map();nodes.forEach(n=>{const d=depths.get(n.id);if(!byDepth.has(d))byDepth.set(d,[]);byDepth.get(d).push(n);});
+        for(const [d,arr] of byDepth){arr.sort((a,b)=>a.id.localeCompare(b.id));const used=[];usedBy.set(d,used);for(const n of arr){
+          const hue=pick(hash32(n.id)%360,used,24);used.push(hue);map.set(n.id,`hsl(${Math.round(hue)},65%,62%)`);}}return map;}
+
+      /* ---------- Mode ---------- */
+      let labelMode = 'dollars';      // controls numeric suffix (USD vs %)
+      let anonymizeMode = 'names';    // NEW: controls which name to show (label vs alternate_label)
+
+      // Watchdog & retry
+      let payloadTimer = null;
+      function showRetry(msg) {
+        const c = document.getElementById('chart');
+        c.innerHTML = '';
+        const div = document.createElement('div');
+        div.className = 'loader';
+        div.innerHTML = `<div class="spinner"></div>${msg || 'Still waiting…'}`;
+        const btn = document.createElement('button');
+        btn.textContent = 'Retry';
+        btn.style.marginLeft = '10px';
+        btn.onclick = () => requestPayload();
+        div.appendChild(btn);
+        c.appendChild(div);
+      }
+
+      function requestPayload() {
+        const chart = document.getElementById('chart');
+        chart.innerHTML = '<div class="loader"><div class="spinner"></div>Loading…</div>';
+        console.log('[Sankey] Requesting payload…');
+
+        // Clear any existing timer
+        if (payloadTimer) clearTimeout(payloadTimer);
+        payloadTimer = setTimeout(() => {
+          console.warn('[Sankey] Payload taking unusually long…');
+          showRetry('Still waiting for data from Apps Script…');
+        }, 10000); // 10s watchdog
+
+        google.script.run
+          .withSuccessHandler((payload) => {
+            clearTimeout(payloadTimer);
+            console.log('[Sankey] Payload received.');
+            try { draw(payload); }
+            catch (err) {
+              console.error('[Sankey] draw() crashed:', err);
+              const c = document.getElementById('chart');
+              c.innerHTML = '';
+              const pre = document.createElement('pre');
+              pre.textContent = 'Rendering error: ' + (err && err.message ? err.message : err);
+              c.appendChild(pre);
+            }
+          })
+          .withFailureHandler((err) => {
+            clearTimeout(payloadTimer);
+            console.error('[Sankey] Apps Script error:', err);
+            const c = document.getElementById('chart');
+            c.innerHTML = '';
+            const pre = document.createElement('pre');
+            pre.textContent = 'Error: ' + (err && err.message ? err.message : err);
+            c.appendChild(pre);
+          })
+          .getNetWorthPayload();
+      }
+
+      document.addEventListener('DOMContentLoaded', () => {
+        console.log('[Sankey] Boot');
+        if (!(window.google && google.script && google.script.run)) {
+          const c = document.getElementById('chart');
+          c.textContent = 'Client-server bridge unavailable.';
+          console.error('[Sankey] google.script.run not available.');
+          return;
+        }
+        requestPayload();
+      });
+
+      function draw(payload) {
+        const container = document.getElementById('chart');
+        const status = document.getElementById('status');
+        container.innerHTML = '';
+        status.textContent = 'Rendering chart…';
+
+        const nodes = (payload.nodes || []).map(n => ({
+          id: n.id,
+          label: n.label,
+          alternate_label: (typeof n.alternate_label === 'string' && n.alternate_label.trim()) ? n.alternate_label : null,
+          amount: (n.amount != null && isFinite(n.amount)) ? Number(n.amount) : null,
+          order: (typeof n.order === 'number') ? n.order : 0
+        }));
+        const idSet = new Set(nodes.map(n => n.id));
+        const links = (payload.links || [])
+          .filter(l => idSet.has(l.source) && idSet.has(l.target) && isFinite(l.value) && l.value > 0)
+          .map(l => ({ source: String(l.source), target: String(l.target), value: Number(l.value) }));
+
+        const colors = assignColorsUniquePerDepth(nodes, links, 'NW');
+
+        // ------- Fixed pixel canvas with auto-downscale to stay under 1,000,000 px -------
+        let width = 1200, height = 900;   // your base canvas
+        const maxPixelsRender = 950_000;  // render cap (safe headroom)
+        const area = width * height;
+        if (area > maxPixelsRender) {
+          const scale = Math.sqrt(maxPixelsRender / area);
+          width = Math.round(width * scale);
+          height = Math.round(height * scale);
+          console.log(`[Sankey] Auto-scaled rendered SVG to ${width}x${height} (≤ 1M px)`);
+        }
+
+        const margin = { top: 16, right: 28, bottom: 16, left: 16 };
+        const nodeWidth = 22;
+
+        const svg = d3.select(container).append('svg').attr('width', width).attr('height', height);
+        svg.append('rect').attr('x', 0).attr('y', 0).attr('width', width).attr('height', height).attr('fill', '#ffffff');
+
+        const sankey = d3.sankey()
+          .nodeId(d => d.id)
+          .nodeWidth(nodeWidth)
+          .nodePadding(56)
+          .nodeAlign(d3.sankeyJustify)
+          .nodeSort((a, b) => d3.ascending(a.order ?? 0, b.order ?? 0))
+          .linkSort((a, b) => {
+            const ta = (a.target.order ?? 0), tb = (b.target.order ?? 0);
+            if (ta !== tb) return d3.ascending(ta, tb);
+            const sa = (a.source.order ?? 0), sb = (b.source.order ?? 0);
+            return d3.ascending(sa, sb);
+          })
+          .iterations(64)
+          .extent([[margin.left, margin.top], [width - margin.right, height - margin.bottom]]);
+
+        const graph = sankey({
+          nodes: nodes.map(d => ({ ...d })),
+          links: links.map(d => ({ ...d }))
+        });
+
+        function totalOutOf(n){return (n.sourceLinks||[]).reduce((a,l)=>a+l.value,0);}
+        function totalInto(n){return (n.targetLinks||[]).reduce((a,l)=>a+l.value,0);}
+        graph.nodes.forEach(n=>{
+          const own=(n.amount!=null&&isFinite(n.amount))?n.amount:NaN;
+          const flow=Math.max(totalInto(n)||0,totalOutOf(n)||0);
+          n.flowValue=(flow>0)?flow:(isFinite(own)?own:NaN);
+          n.labelValue=isFinite(own)?own:(isFinite(flow)?flow:NaN);
+        });
+        const root=graph.nodes.find(nn=>nn.id==='NW');
+        const rootTotal = root ? (totalOutOf(root) || totalInto(root) || root.flowValue || 0) : 0;
+
+        // ---- Label text builder: anonymizeMode controls name; labelMode controls numeric suffix
+        const displayName = n => {
+          const baseName = (anonymizeMode === 'anonymized' && n.alternate_label) ? n.alternate_label : n.label;
+
+          if (labelMode === 'percent' && rootTotal > 0 && isFinite(n.flowValue)) {
+            return `${baseName} (${fmtPct1.format(n.flowValue / rootTotal)})`;
+          }
+          return isFinite(n.labelValue) ? `${baseName} (${fmtUSD0.format(n.labelValue)})` : baseName;
+        };
+
+        // Links
+        svg.append('g').attr('fill', 'none')
+          .selectAll('path')
+          .data(graph.links)
+          .join('path')
+          .attr('d', d3.sankeyLinkHorizontal())
+          .attr('stroke', d => colors.get(d.source.id || d.source) || '#6aa6ff')
+          .attr('stroke-opacity', 0.88)
+          .attr('stroke-width', d => Math.max(1, d.width));
+
+        // Nodes
+        const node = svg.append('g').selectAll('g').data(graph.nodes).join('g').attr('class', 'node');
+        node.append('rect')
+          .attr('x', d => d.x0).attr('y', d => d.y0)
+          .attr('height', d => Math.max(1, d.y1 - d.y0)).attr('width', d => Math.max(1, d.x1 - d.x0))
+          .attr('fill', d => colors.get(d.id) || '#6aa6ff').attr('stroke', '#ccc');
+
+        // Labels (overflow-aware: flip to left if needed)
+        const labelSel = node.append('text')
+          .attr('y', d => (d.y0 + d.y1) / 2)
+          .attr('dy', '0.35em')
+          .text(d => displayName(d));
+
+        function positionLabels() {
+          labelSel
+            .attr('x', d => d.x1 + LABEL_PAD)       // start on the right
+            .attr('text-anchor', 'start')
+            .each(function(d) {
+              const t = d3.select(this);
+              const bbox = this.getBBox();
+              const xRight = (d.x1 + LABEL_PAD) + bbox.width;
+              const clipEdge = width - margin.right;
+              const needFlip = xRight > clipEdge;
+              t.attr('x', needFlip ? (d.x0 - LABEL_PAD) : (d.x1 + LABEL_PAD))
+               .attr('text-anchor', needFlip ? 'end' : 'start');
+            });
+        }
+
+        // Grow only the logical coordinate system (viewBox), never the pixel canvas
+        svg.attr('preserveAspectRatio', 'xMinYMin meet');
+        function ensureLabelsFitWithoutGrowingPixels() {
+          const maxX = d3.max(labelSel.nodes(), n => {
+            const b = n.getBBox();
+            return b.x + b.width;
+          });
+          const visibleRightEdge = width - margin.right;
+          const overflow = Math.max(0, maxX - visibleRightEdge);
+
+          if (overflow > 0) {
+            const vb = svg.attr('viewBox');
+            const vbParts = vb ? vb.split(/\s+/).map(Number) : [0,0,width,height];
+            const vbW = vbParts[2] || width;
+            const vbH = vbParts[3] || height;
+            const newVbW = Math.max(vbW, width + overflow + 12); // small padding
+            svg.attr('viewBox', `0 0 ${newVbW} ${vbH}`);
+            console.log(`[Sankey] Expanded viewBox to ${newVbW}×${vbH} to fit labels (pixels unchanged)`);
+          } else if (!svg.attr('viewBox')) {
+            // initialize viewBox to match current canvas if not set
+            svg.attr('viewBox', `0 0 ${width} ${height}`);
+          }
+        }
+
+        // initial pass
+        positionLabels();
+        ensureLabelsFitWithoutGrowingPixels();
+
+        // Update labels on mode change
+        window.__sankey_updateLabels = () => {
+          labelSel.text(d => displayName(d));
+          positionLabels();
+          ensureLabelsFitWithoutGrowingPixels();
+        };
+
+        // ---------- Export helpers (fixed to allow scale < 1 and enforce limits) ----------
+        async function exportSvgWithCanvgDataUrl(container, {
+          preferredMime = 'image/jpeg',
+          jpegQualityStart = 0.78,
+          jpegQualityMin = 0.55,
+          // Headroom under Apps Script limits (2 MB, 1,000,000 px)
+          maxBytes  = 1_950_000,
+          maxPixels = 950_000,
+          startScale = 1.0
+        } = {}) {
+          const svgEl = container.querySelector('svg');
+          if (!svgEl) throw new Error('SVG not found.');
+
+          const w = Number(svgEl.getAttribute('width') || container.clientWidth || 900);
+          const h = Number(svgEl.getAttribute('height') || container.clientHeight || 560);
+
+          const clone = svgEl.cloneNode(true);
+          if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+          if (!clone.getAttribute('xmlns:xlink')) clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink');
+
+          // Allow scale < 1 so we can get under the pixel cap
+          let scale = startScale;
+          const maxScaleByPixels = Math.sqrt(950000 / Math.max(1, w * h));
+          scale = Math.min(scale, maxScaleByPixels * 0.99);
+
+          let mime = preferredMime;
+          let quality = jpegQualityStart;
+
+          let lastDataUrl = null;
+
+          for (let attempt = 0; attempt < 12; attempt++) {
+            const canvas = document.createElement('canvas');
+            const cw = Math.max(1, Math.floor(w * scale));
+            const ch = Math.max(1, Math.floor(h * scale));
+            canvas.width  = cw;
+            canvas.height = ch;
+
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, cw, ch);
+
+            const v = canvg.Canvg.fromString(
+              ctx,
+              new XMLSerializer().serializeToString(clone),
+              { ignoreMouse: true, ignoreAnimation: true, useCORS: true }
+            );
+            await v.render();
+
+            const dataUrl = (mime === 'image/png')
+              ? canvas.toDataURL('image/png')
+              : canvas.toDataURL('image/jpeg', quality);
+
+            lastDataUrl = dataUrl;
+
+            // Accurate byte count (accounts for base64 padding)
+            const b64 = dataUrl.split(',')[1] || '';
+            const pad = (b64.match(/=+$/) || [''])[0].length;
+            const bytes = Math.floor(b64.length * 0.75) - pad;
+            const pixels = cw * ch;
+
+            if (bytes <= 1_950_000 && pixels <= 950_000) return dataUrl;
+
+            // Lower JPEG quality first
+            if (mime !== 'image/png' && quality > jpegQualityMin + 0.03) {
+              quality = Math.max(jpegQualityMin, quality - 0.08);
+              continue;
+            }
+
+            // Then reduce scale
+            const nextScale = scale * 0.9;
+            if (nextScale < scale - 1e-3) {
+              scale = nextScale;
+              continue;
+            }
+
+            // Finally, if PNG, try switching to JPEG once
+            if (mime === 'image/png') {
+              mime = 'image/jpeg';
+              quality = jpegQualityStart;
+              continue;
+            }
+
+            break;
+          }
+
+          if (lastDataUrl) return lastDataUrl;
+          throw new Error('Failed to generate image under size/pixel limits.');
+        }
+
+        // ---------- Chunked upload ----------
+        function splitBase64(b64, chunkChars = 200_000) {
+          const out = [];
+          for (let i = 0; i < b64.length; i += chunkChars) out.push(b64.slice(i, i + chunkChars));
+          return out;
+        }
+        function gas(method, ...args) {
+          return new Promise((resolve, reject) => {
+            google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[method](...args);
+          });
+        }
+        async function uploadImageInChunks(dataUrl) {
+          const m = /^data:image\/(png|jpeg);base64,(.+)$/.exec(dataUrl);
+          if (!m) throw new Error('Unexpected image format.');
+          const mimeSubtype = m[1];
+          const base64 = m[2];
+          const chunks = splitBase64(base64, 200_000);
+
+          const { sessionId } = await gas('startImageUpload');
+          for (let i = 0; i < chunks.length; i++) {
+            await gas('uploadImageChunk', sessionId, i, chunks[i]);
+          }
+          await gas('finalizeImageUpload', sessionId, mimeSubtype, 'networth-sankey.' + (mimeSubtype === 'png' ? 'png' : 'jpg'));
+        }
+
+        // ===== Maintain current image & regenerate on mode change =====
+        let currentDataUrl = null;
+        let isRegenerating = false;
+        let insertBtn = null;
+        let dlBtn = null;
+
+        async function updateInsertDownloadState() {
+          if (!currentDataUrl) return;
+          // Accurate base64 size
+          const base64 = (currentDataUrl.split(',')[1] || '');
+          const pad = (base64.match(/=+$/) || [''])[0].length;
+          const bytes = Math.floor(base64.length * 0.75) - pad;
+          const mb = bytes / (1024 * 1024);
+
+          // Dimensions to enforce pixel cap for Apps Script insertion
+          await new Promise(res => {
+            const img = new Image();
+            img.onload = () => {
+              const pixels = img.width * img.height;
+              console.log(`[Sankey] Dimensions: ${img.width}x${img.height} (${pixels} px)`);
+              if (insertBtn) {
+                insertBtn.disabled = (mb > 1.95 || pixels > 1_000_000);
+              }
+              if (mb > 1.95 || pixels > 1_000_000) {
+                status.textContent = 'Image too large to insert (limit 2 MB and 1,000,000 pixels). Try reducing the diagram size.';
+              } else {
+                status.textContent = 'Ready.';
+                setTimeout(() => { if (status.textContent === 'Ready.') status.textContent = ''; }, 1500);
+              }
+              res();
+            };
+            img.src = currentDataUrl;
+          });
+        }
+
+        async function regenerateImage() {
+          if (isRegenerating) return;
+          isRegenerating = true;
+          const prev = status.textContent;
+          status.textContent = 'Generating image…';
+          try {
+            const dataUrl = await exportSvgWithCanvgDataUrl(container);
+            currentDataUrl = dataUrl;
+            await updateInsertDownloadState();
+          } catch (e) {
+            console.error(e);
+            status.textContent = 'Could not generate image: ' + (e && e.message ? e.message : e);
+          } finally {
+            isRegenerating = false;
+            if (!status.textContent.startsWith('Error') && !status.textContent.startsWith('Image too large')) {
+              status.textContent = 'Ready.';
+              setTimeout(() => { if (status.textContent === 'Ready.') status.textContent = ''; }, 1500);
+            }
+          }
+        }
+
+        // Buttons UI (build once; wire to latest image)
+        const row = document.querySelector('.row');
+        const btnWrap = document.createElement('div');
+        btnWrap.className = 'btns';
+
+        insertBtn = document.createElement('button');
+        insertBtn.textContent = 'Insert image into sheet';
+        insertBtn.addEventListener('click', async () => {
+          try {
+            if (!currentDataUrl) await regenerateImage();
+            insertBtn.disabled = true;
+            insertBtn.textContent = 'Uploading…';
+            status.textContent = 'Uploading…';
+            await uploadImageInChunks(currentDataUrl);
+            insertBtn.textContent = 'Inserted!';
+            status.textContent = 'Done.';
+            google.script.host.close();
+          } catch (e) {
+            console.error(e);
+            insertBtn.disabled = false;
+            insertBtn.textContent = 'Insert image into sheet';
+            status.textContent = 'Error (insert): ' + (e && e.message ? e.message : e);
+          }
+        });
+
+        dlBtn = document.createElement('button');
+        dlBtn.textContent = 'Download image';
+        dlBtn.addEventListener('click', async () => {
+          try {
+            if (!currentDataUrl) await regenerateImage();
+            status.textContent = 'Downloading…';
+            const a = document.createElement('a');
+            a.href = currentDataUrl;
+            a.download = currentDataUrl.startsWith('data:image/png') ? 'networth-sankey.png' : 'networth-sankey.jpg';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            status.textContent = 'Ready.';
+            setTimeout(() => { if (status.textContent === 'Ready.') status.textContent = ''; }, 1200);
+          } catch (e) {
+            console.error(e);
+            status.textContent = 'Error (download): ' + (e && e.message ? e.message : e);
+          }
+        });
+
+        btnWrap.appendChild(insertBtn);
+        const spacer = document.querySelector('.spacer');
+        row.insertBefore(btnWrap, spacer);
+        row.appendChild(dlBtn);
+
+        // Dollars / Percent toggle (numeric suffix)
+        document.querySelectorAll('input[name="labelMode"]').forEach(r =>
+          r.addEventListener('change', async e => {
+            labelMode = e.target.value;
+            if (window.__sankey_updateLabels) window.__sankey_updateLabels();
+            await regenerateImage();
+          })
+        );
+
+        // NEW: Anonymize labels toggle (name portion)
+        document.querySelectorAll('input[name="anonymizeMode"]').forEach(r =>
+          r.addEventListener('change', async e => {
+            anonymizeMode = e.target.value;
+            if (window.__sankey_updateLabels) window.__sankey_updateLabels();
+            await regenerateImage();
+          })
+        );
+
+        // Initial image build and finally show mode switches
+        (async () => {
+          await regenerateImage();
+          document.getElementById('modeSwitch').style.display = 'inline-flex';
+          document.getElementById('anonymizeSwitch').style.display = 'inline-flex'; // NEW
+        })();
+      }
+    </script>
+  </body>
+</html>
